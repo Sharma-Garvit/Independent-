@@ -12,6 +12,7 @@ const NOTION_DATABASE_ID = process.env.NOTION_DATABASE_ID || '';
 const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'llama3.2:3b';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+const OPENAI_RESEARCH_MODEL = process.env.OPENAI_RESEARCH_MODEL || 'gpt-4.1';
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
 const localYtDlpPath = path.join(__dirname, '..', 'extractor', 'yt-dlp.exe');
 const YT_DLP_PATH = process.env.YT_DLP_PATH || (fs.existsSync(localYtDlpPath) ? localYtDlpPath : 'yt-dlp');
@@ -80,6 +81,50 @@ function normalizeScore(value) {
   if (!Number.isFinite(num)) return 0;
   if (num <= 1) return Math.round(num * 100);
   return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function joinBullets(items) {
+  return ensureArray(items)
+    .map(item => ensureString(item))
+    .filter(Boolean)
+    .join(' | ');
+}
+
+function normalizeKnowledgeCard(card = {}) {
+  return {
+    exact_topic: ensureString(card.exact_topic),
+    who_it_is_for: ensureString(card.who_it_is_for),
+    why_it_matters: ensureString(card.why_it_matters),
+    core_points: ensureArray(card.core_points).slice(0, 6),
+    steps: ensureArray(card.steps).slice(0, 6),
+    tools_and_resources: ensureArray(card.tools_and_resources).slice(0, 6),
+    use_cases: ensureArray(card.use_cases).slice(0, 5),
+    cautions: ensureArray(card.cautions).slice(0, 4),
+    research_notes: ensureArray(card.research_notes).slice(0, 4),
+  };
+}
+
+function formatKnowledgeCard(card = {}) {
+  const safe = normalizeKnowledgeCard(card);
+  const sections = [
+    ['Exact Topic', safe.exact_topic],
+    ['Who This Is For', safe.who_it_is_for],
+    ['Why It Matters', safe.why_it_matters],
+    ['Core Points', safe.core_points],
+    ['Steps To Apply', safe.steps],
+    ['Tools And Resources', safe.tools_and_resources],
+    ['Best Use Cases', safe.use_cases],
+    ['Cautions', safe.cautions],
+    ['Research Notes', safe.research_notes],
+  ];
+
+  return sections
+    .filter(([, value]) => Array.isArray(value) ? value.length : ensureString(value))
+    .map(([label, value]) => Array.isArray(value)
+      ? `${label}:\n- ${value.join('\n- ')}`
+      : `${label}:\n${value}`)
+    .join('\n\n')
+    .slice(0, 1800);
 }
 
 function cleanLink(raw) {
@@ -267,7 +312,8 @@ function mapNotionItem(page) {
     summary: props.Summary?.rich_text?.[0]?.plain_text || '',
     key_takeaway: props['Key Takeaway']?.rich_text?.[0]?.plain_text || '',
     action_items: props['Action Items']?.rich_text?.[0]?.plain_text || '',
-    websites: props.Websites?.rich_text?.[0]?.plain_text || ''
+    websites: props.Websites?.rich_text?.[0]?.plain_text || '',
+    source_text: props['Source Text']?.rich_text?.[0]?.plain_text || ''
   };
 }
 
@@ -287,9 +333,9 @@ async function createNotionPage(item) {
         Title: { title: [{ text: { content: ensureString(item.title, 'Instagram save') } }] },
         URL: { url: item.url },
         Type: { select: { name: ensureString(item.type, 'Unknown') } },
-        Summary: { rich_text: [{ text: { content: ensureArray(item.summary).join(' ') } }] },
+        Summary: { rich_text: [{ text: { content: joinBullets(item.summary).slice(0, 1800) } }] },
         'Key Takeaway': { rich_text: [{ text: { content: ensureString(item.key_takeaway, 'Review this saved item later.') } }] },
-        'Action Items': { rich_text: [{ text: { content: ensureArray(item.action_items).join(' | ') } }] },
+        'Action Items': { rich_text: [{ text: { content: joinBullets(item.action_items).slice(0, 1800) } }] },
         'Saved Note': { rich_text: [{ text: { content: ensureString(item.user_note, '') } }] },
         Status: { select: { name: normalizeStatus(ensureString(item.status, 'Needs Manual Context')) } },
         'Actionability Score': { number: normalizeScore(item.actionability_score) },
@@ -320,10 +366,13 @@ async function updateNotionStatus(pageId, status) {
 }
 
 function buildAiPrompt(input) {
-  return `You convert saved Instagram content into practical notes for one user. Return JSON only.
+  return `You convert saved Instagram content into a high-signal knowledge card so the user does not need to rewatch the reel.
+Return JSON only.
 Allowed status values: New or Needs Manual Context.
-Use websites only when clearly present.
+Use websites only when clearly present or strongly supported by the content.
 Keep tags short and lowercase.
+Be concrete and exact. Prefer named methods, steps, tools, and frameworks over vague summaries.
+If the reel is weak or incomplete, say so in cautions instead of inventing details.
 
 Required keys:
 {
@@ -336,8 +385,27 @@ Required keys:
   "websites": string[],
   "status": "New" | "Needs Manual Context",
   "actionability_score": number,
-  "confidence": number
+  "confidence": number,
+  "knowledge_card": {
+    "exact_topic": string,
+    "who_it_is_for": string,
+    "why_it_matters": string,
+    "core_points": string[],
+    "steps": string[],
+    "tools_and_resources": string[],
+    "use_cases": string[],
+    "cautions": string[],
+    "research_notes": string[]
+  }
 }
+
+Rules:
+- summary should be 3 to 6 dense bullets, each useful on its own.
+- action_items should be real next steps the user can do.
+- research_notes should only add short clarifications that help the user apply or understand the topic better.
+- steps should capture the creator's method in the right order when possible.
+- tools_and_resources should include websites, apps, or named methods.
+- cautions should mention assumptions, missing context, or potential limits.
 
 Instagram URL: ${input.url}
 Detected type: ${input.source_type}
@@ -349,6 +417,51 @@ Transcript: ${input.transcript}
 Detected websites: ${ensureArray(input.websites).join(', ')}
 Why user saved this: ${input.user_note}
 Extra raw text: ${input.raw_text}`;
+}
+
+function buildResearchPrompt(input) {
+  return `You are enriching an Instagram reel knowledge card with careful web research.
+Return JSON only.
+Stay tightly anchored to the extracted reel content. Do not drift into unrelated web results.
+Use web search only to clarify names, tools, methods, websites, products, or concepts that are strongly suggested by the content.
+If the reel is too ambiguous, keep research_notes conservative.
+
+Required keys:
+{
+  "title": string,
+  "type": "Reel" | "Post" | "Unknown",
+  "summary": string[],
+  "key_takeaway": string,
+  "action_items": string[],
+  "tags": string[],
+  "websites": string[],
+  "status": "New" | "Needs Manual Context",
+  "actionability_score": number,
+  "confidence": number,
+  "knowledge_card": {
+    "exact_topic": string,
+    "who_it_is_for": string,
+    "why_it_matters": string,
+    "core_points": string[],
+    "steps": string[],
+    "tools_and_resources": string[],
+    "use_cases": string[],
+    "cautions": string[],
+    "research_notes": string[]
+  }
+}
+
+Content to analyze:
+- URL: ${input.url}
+- Type: ${input.source_type}
+- Title: ${input.media_title}
+- Uploader: ${input.uploader}
+- Description: ${input.description}
+- Transcript source: ${input.transcript_source}
+- Transcript: ${input.transcript}
+- Existing websites: ${ensureArray(input.websites).join(', ')}
+- User note: ${input.user_note}
+- Extra text: ${input.raw_text}`;
 }
 
 async function generateAiWithOpenAI(prompt) {
@@ -385,11 +498,41 @@ async function generateAiWithOllama(prompt) {
   return JSON.parse(data.response || '{}');
 }
 
+async function generateAiWithOpenAIResearch(input) {
+  const resp = await fetch('https://api.openai.com/v1/responses', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: OPENAI_RESEARCH_MODEL,
+      tools: [{ type: 'web_search' }],
+      input: buildResearchPrompt(input)
+    })
+  });
+
+  if (!resp.ok) throw new Error(`OpenAI research failed: ${resp.status} ${await resp.text()}`);
+  const data = await resp.json();
+  const text = ensureString(data.output_text);
+  return JSON.parse(text || '{}');
+}
+
 async function generateAi(input) {
   const prompt = buildAiPrompt(input);
-  const parsed = OPENAI_API_KEY
-    ? await generateAiWithOpenAI(prompt)
-    : await generateAiWithOllama(prompt);
+  let parsed;
+
+  if (OPENAI_API_KEY) {
+    try {
+      parsed = await generateAiWithOpenAIResearch(input);
+    } catch {
+      parsed = await generateAiWithOpenAI(prompt);
+    }
+  } else {
+    parsed = await generateAiWithOllama(prompt);
+  }
+
+  const knowledgeCard = normalizeKnowledgeCard(parsed.knowledge_card);
 
   return {
     title: ensureString(parsed.title, input.media_title || 'Instagram save'),
@@ -402,6 +545,7 @@ async function generateAi(input) {
     status: normalizeStatus(ensureString(parsed.status, input.transcript ? 'New' : 'Needs Manual Context')),
     actionability_score: normalizeScore(parsed.actionability_score),
     confidence: normalizeConfidence(parsed.confidence),
+    knowledge_card: knowledgeCard,
   };
 }
 
@@ -455,7 +599,7 @@ const server = http.createServer(async (req, res) => {
         ...ai,
         url: body.url || extracted.originalUrl,
         user_note: ensureString(body.user_note),
-        source_text: [ensureString(extracted.description), ensureString(extracted.transcript), ensureString(body.raw_text)].filter(Boolean).join(' ').slice(0, 1800),
+        source_text: formatKnowledgeCard(ai.knowledge_card),
       });
 
       return sendJson(res, 200, {
@@ -468,6 +612,8 @@ const server = http.createServer(async (req, res) => {
         action_items: ai.action_items,
         tags: ai.tags,
         websites: ai.websites,
+        knowledge_card: ai.knowledge_card,
+        knowledge_card_text: formatKnowledgeCard(ai.knowledge_card),
         transcript_source: extracted.transcriptSource,
         actionability_score: ai.actionability_score,
         confidence: ai.confidence,
