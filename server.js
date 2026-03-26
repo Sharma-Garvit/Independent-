@@ -92,9 +92,11 @@ function joinBullets(items) {
 
 function normalizeKnowledgeCard(card = {}) {
   return {
+    reel_overview: ensureString(card.reel_overview),
     exact_topic: ensureString(card.exact_topic),
     who_it_is_for: ensureString(card.who_it_is_for),
     why_it_matters: ensureString(card.why_it_matters),
+    creator_claims: ensureArray(card.creator_claims).slice(0, 6),
     core_points: ensureArray(card.core_points).slice(0, 6),
     steps: ensureArray(card.steps).slice(0, 6),
     tools_and_resources: ensureArray(card.tools_and_resources).slice(0, 6),
@@ -107,9 +109,11 @@ function normalizeKnowledgeCard(card = {}) {
 function formatKnowledgeCard(card = {}) {
   const safe = normalizeKnowledgeCard(card);
   const sections = [
+    ['What Was Said', safe.reel_overview],
     ['Exact Topic', safe.exact_topic],
     ['Who This Is For', safe.who_it_is_for],
     ['Why It Matters', safe.why_it_matters],
+    ['Creator Claims', safe.creator_claims],
     ['Core Points', safe.core_points],
     ['Steps To Apply', safe.steps],
     ['Tools And Resources', safe.tools_and_resources],
@@ -369,7 +373,7 @@ function buildAiPrompt(input) {
   return `You convert saved Instagram content into a high-signal knowledge card so the user does not need to rewatch the reel.
 Return JSON only.
 Allowed status values: New or Needs Manual Context.
-Use websites only when clearly present or strongly supported by the content.
+Use the websites field for any named app, website, tool, platform, or product mentioned in the reel. If a full link is available, use it. If only a name is known, return the name.
 Keep tags short and lowercase.
 Be concrete and exact. Prefer named methods, steps, tools, and frameworks over vague summaries.
 If the reel is weak or incomplete, say so in cautions instead of inventing details.
@@ -387,9 +391,11 @@ Required keys:
   "actionability_score": number,
   "confidence": number,
   "knowledge_card": {
+    "reel_overview": string,
     "exact_topic": string,
     "who_it_is_for": string,
     "why_it_matters": string,
+    "creator_claims": string[],
     "core_points": string[],
     "steps": string[],
     "tools_and_resources": string[],
@@ -400,12 +406,15 @@ Required keys:
 }
 
 Rules:
-- summary should be 3 to 6 dense bullets, each useful on its own.
+- summary should be 4 to 7 dense bullets, each useful on its own.
+- summary must capture what the creator actually said, not just your interpretation.
+- reel_overview must be a short paragraph explaining the reel in plain language.
 - action_items should be real next steps the user can do.
 - research_notes should only add short clarifications that help the user apply or understand the topic better.
 - steps should capture the creator's method in the right order when possible.
-- tools_and_resources should include websites, apps, or named methods.
+- tools_and_resources should include websites, apps, software, platforms, or named methods.
 - cautions should mention assumptions, missing context, or potential limits.
+- If the creator mentions an app or website, include it in both websites and tools_and_resources.
 
 Instagram URL: ${input.url}
 Detected type: ${input.source_type}
@@ -439,9 +448,11 @@ Required keys:
   "actionability_score": number,
   "confidence": number,
   "knowledge_card": {
+    "reel_overview": string,
     "exact_topic": string,
     "who_it_is_for": string,
     "why_it_matters": string,
+    "creator_claims": string[],
     "core_points": string[],
     "steps": string[],
     "tools_and_resources": string[],
@@ -537,11 +548,11 @@ async function generateAi(input) {
   return {
     title: ensureString(parsed.title, input.media_title || 'Instagram save'),
     type: ensureString(parsed.type, input.source_type || 'Unknown'),
-    summary: ensureArray(parsed.summary),
+    summary: ensureArray(parsed.summary).slice(0, 7),
     key_takeaway: ensureString(parsed.key_takeaway, 'Review this saved item later.'),
-    action_items: ensureArray(parsed.action_items),
+    action_items: ensureArray(parsed.action_items).slice(0, 6),
     tags: ensureArray(parsed.tags),
-    websites: [...new Set([...ensureArray(parsed.websites), ...ensureArray(input.websites)])],
+    websites: [...new Set([...ensureArray(parsed.websites), ...ensureArray(input.websites)])].slice(0, 8),
     status: normalizeStatus(ensureString(parsed.status, input.transcript ? 'New' : 'Needs Manual Context')),
     actionability_score: normalizeScore(parsed.actionability_score),
     confidence: normalizeConfidence(parsed.confidence),
