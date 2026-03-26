@@ -140,6 +140,36 @@ function extractLinks(text) {
   return [...new Set(matches.map(cleanLink).filter(link => link.includes('.')))];
 }
 
+function splitSentences(text) {
+  return ensureString(text)
+    .replace(/\s+/g, ' ')
+    .split(/(?<=[.!?])\s+/)
+    .map(part => part.trim())
+    .filter(part => part.length > 24);
+}
+
+function extractNamedTools(text) {
+  const catalog = [
+    'Notion', 'Canva', 'CapCut', 'Figma', 'ChatGPT', 'OpenAI', 'Midjourney', 'Google Docs',
+    'Google Drive', 'Google Sheets', 'Excel', 'Slack', 'Telegram', 'WhatsApp', 'YouTube',
+    'Instagram', 'Pinterest', 'Shopify', 'Gumroad', 'Substack', 'Zapier', 'n8n', 'Airtable',
+    'Trello', 'Asana', 'Supabase', 'Framer', 'Webflow', 'VS Code', 'Claude', 'Cursor'
+  ];
+  const haystack = ensureString(text);
+  return catalog.filter(name => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(haystack));
+}
+
+function fallbackOverview(input) {
+  const sentences = splitSentences([input.transcript, input.description, input.raw_text].filter(Boolean).join(' '));
+  return sentences.slice(0, 2).join(' ').slice(0, 320);
+}
+
+function fallbackBullets(input, max = 5) {
+  return splitSentences([input.transcript, input.description, input.raw_text].filter(Boolean).join(' '))
+    .slice(0, max)
+    .map(sentence => sentence.replace(/\s+/g, ' ').trim());
+}
+
 function parseVtt(content) {
   return content
     .split(/\r?\n/)
@@ -546,15 +576,52 @@ async function generateAi(input) {
   }
 
   const knowledgeCard = normalizeKnowledgeCard(parsed.knowledge_card);
+  const inferredTools = extractNamedTools([input.transcript, input.description, input.raw_text].filter(Boolean).join(' '));
+  const mergedResources = [...new Set([
+    ...ensureArray(parsed.websites),
+    ...ensureArray(input.websites),
+    ...inferredTools
+  ])].slice(0, 8);
+
+  if (!knowledgeCard.reel_overview) {
+    knowledgeCard.reel_overview = fallbackOverview(input) || 'The reel did not expose enough clear spoken content to create a stronger overview.';
+  }
+
+  if (!knowledgeCard.creator_claims.length) {
+    knowledgeCard.creator_claims = fallbackBullets(input, 4);
+  }
+
+  if (!knowledgeCard.core_points.length) {
+    knowledgeCard.core_points = fallbackBullets(input, 5);
+  }
+
+  if (!knowledgeCard.steps.length) {
+    knowledgeCard.steps = ensureArray(parsed.action_items).slice(0, 5);
+  }
+
+  if (!knowledgeCard.tools_and_resources.length) {
+    knowledgeCard.tools_and_resources = mergedResources.slice(0, 6);
+  }
+
+  const summary = ensureArray(parsed.summary).slice(0, 7);
+  if (summary.length < 4) {
+    const fallback = fallbackBullets(input, 6).filter(item => !summary.includes(item));
+    summary.push(...fallback.slice(0, 4 - summary.length));
+  }
+
+  const actionItems = ensureArray(parsed.action_items).slice(0, 6);
+  if (!actionItems.length && knowledgeCard.steps.length) {
+    actionItems.push(...knowledgeCard.steps.slice(0, 4));
+  }
 
   return {
     title: ensureString(parsed.title, input.media_title || 'Instagram save'),
     type: ensureString(parsed.type, input.source_type || 'Unknown'),
-    summary: ensureArray(parsed.summary).slice(0, 7),
+    summary,
     key_takeaway: ensureString(parsed.key_takeaway, 'Review this saved item later.'),
-    action_items: ensureArray(parsed.action_items).slice(0, 6),
+    action_items: actionItems,
     tags: ensureArray(parsed.tags),
-    websites: [...new Set([...ensureArray(parsed.websites), ...ensureArray(input.websites)])].slice(0, 8),
+    websites: mergedResources,
     status: normalizeStatus(ensureString(parsed.status, input.transcript ? 'New' : 'Needs Manual Context')),
     actionability_score: normalizeScore(parsed.actionability_score),
     confidence: normalizeConfidence(parsed.confidence),
