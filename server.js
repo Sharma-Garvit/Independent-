@@ -317,7 +317,9 @@ function mapNotionItem(page) {
     key_takeaway: props['Key Takeaway']?.rich_text?.[0]?.plain_text || '',
     action_items: props['Action Items']?.rich_text?.[0]?.plain_text || '',
     websites: props.Websites?.rich_text?.[0]?.plain_text || '',
-    source_text: props['Source Text']?.rich_text?.[0]?.plain_text || ''
+    source_text: props['Source Text']?.rich_text?.[0]?.plain_text || '',
+    actionability_score: props['Actionability Score']?.number ?? 0,
+    confidence: props.Confidence?.number ?? 0
   };
 }
 
