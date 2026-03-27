@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: save-to-action-backend
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: NOTION_TOKEN
+        sync: false
+      - key: NOTION_DATABASE_ID
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_RESEARCH_MODEL
+        value: gpt-4.1
+      - key: YT_DLP_PATH
+        value: yt-dlp
