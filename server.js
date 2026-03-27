@@ -248,7 +248,7 @@ async function getDownloadedAudioFile(tempDir) {
 }
 
 async function extractInstagramContent(url) {
-  if (!fs.existsSync(YT_DLP_PATH)) {
+  if (YT_DLP_PATH !== 'yt-dlp' && !fs.existsSync(YT_DLP_PATH)) {
     throw new Error(`yt-dlp executable not found at ${YT_DLP_PATH}`);
   }
 
