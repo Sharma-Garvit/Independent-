@@ -34,6 +34,10 @@ function sendJson(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
+function sendError(res, status, code, error, detail = '') {
+  return sendJson(res, status, { ok: false, code, error, detail });
+}
+
 function parseBody(req) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -81,6 +85,19 @@ function normalizeScore(value) {
   if (!Number.isFinite(num)) return 0;
   if (num <= 1) return Math.round(num * 100);
   return Math.max(0, Math.min(100, Math.round(num)));
+}
+
+function classifyAnalysisQuality({ status, summary, confidence, action_items, websites, knowledge_card }) {
+  if (normalizeStatus(status) === 'Needs Manual Context') return 'needs-manual-context';
+  const summaryCount = ensureArray(summary).length;
+  const actionCount = ensureArray(action_items).length;
+  const websiteCount = ensureArray(websites).length;
+  const confidenceScore = normalizeScore(confidence);
+  const hasOverview = Boolean(ensureString(knowledge_card?.reel_overview));
+  if (confidenceScore >= 65 && summaryCount >= 4 && actionCount >= 1 && (websiteCount >= 1 || hasOverview)) {
+    return 'strong';
+  }
+  return 'partial';
 }
 
 function joinBullets(items) {
@@ -138,6 +155,14 @@ function cleanLink(raw) {
 function extractLinks(text) {
   const matches = text.match(/(?:https?:\/\/)?(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\/[\w\-./?%&=+#]*)?/g) || [];
   return [...new Set(matches.map(cleanLink).filter(link => link.includes('.')))];
+}
+
+function extractSectionForQuality(text, sectionName) {
+  const source = ensureString(text);
+  if (!source) return '';
+  const escaped = sectionName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = source.match(new RegExp(`${escaped}:\\n([\\s\\S]*?)(?:\\n\\n[A-Z][^\\n]+:|$)`));
+  return ensureString(match?.[1]?.replace(/^- /gm, '').trim());
 }
 
 function splitSentences(text) {
@@ -318,6 +343,15 @@ async function extractInstagramContent(url) {
   }
 }
 
+function validateInstagramUrl(url) {
+  const value = ensureString(url);
+  if (!value) throw new Error('Please provide an Instagram Reel or Post link.');
+  if (!/^https?:\/\/(?:www\.|m\.)?instagram\.com\/(?:reel|p)\//i.test(value)) {
+    throw new Error('Use a full Instagram Reel or Post link.');
+  }
+  return value;
+}
+
 async function notionQuery() {
   requireEnv('NOTION_TOKEN', NOTION_TOKEN);
   requireEnv('NOTION_DATABASE_ID', NOTION_DATABASE_ID);
@@ -336,7 +370,7 @@ async function notionQuery() {
 
 function mapNotionItem(page) {
   const props = page.properties || {};
-  return {
+  const item = {
     page_id: page.id,
     title: props.Title?.title?.[0]?.plain_text || 'Untitled',
     url: props.URL?.url || '',
@@ -348,9 +382,19 @@ function mapNotionItem(page) {
     action_items: props['Action Items']?.rich_text?.[0]?.plain_text || '',
     websites: props.Websites?.rich_text?.[0]?.plain_text || '',
     source_text: props['Source Text']?.rich_text?.[0]?.plain_text || '',
+    saved_note: props['Saved Note']?.rich_text?.[0]?.plain_text || '',
     actionability_score: props['Actionability Score']?.number ?? 0,
     confidence: props.Confidence?.number ?? 0
   };
+  item.analysis_quality = classifyAnalysisQuality({
+    status: item.status,
+    summary: ensureArray(item.summary),
+    confidence: item.confidence,
+    action_items: ensureArray(item.action_items),
+    websites: ensureArray(item.websites),
+    knowledge_card: { reel_overview: extractSectionForQuality(item.source_text, 'What Was Said') }
+  });
+  return item;
 }
 
 async function createNotionPage(item) {
@@ -398,6 +442,37 @@ async function updateNotionStatus(pageId, status) {
     body: JSON.stringify({ properties: { Status: { select: { name: normalizeStatus(status) } } } })
   });
   if (!resp.ok) throw new Error(`Notion status update failed: ${resp.status} ${await resp.text()}`);
+  return resp.json();
+}
+
+async function updateNotionAnalysis(pageId, item) {
+  requireEnv('NOTION_TOKEN', NOTION_TOKEN);
+  const resp = await fetch(`https://api.notion.com/v1/pages/${pageId}`, {
+    method: 'PATCH',
+    headers: {
+      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      'Notion-Version': '2022-06-28',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      properties: {
+        Title: { title: [{ text: { content: ensureString(item.title, 'Instagram save') } }] },
+        URL: { url: item.url },
+        Type: { select: { name: ensureString(item.type, 'Unknown') } },
+        Summary: { rich_text: [{ text: { content: joinBullets(item.summary).slice(0, 1800) } }] },
+        'Key Takeaway': { rich_text: [{ text: { content: ensureString(item.key_takeaway, 'Review this saved item later.') } }] },
+        'Action Items': { rich_text: [{ text: { content: joinBullets(item.action_items).slice(0, 1800) } }] },
+        'Saved Note': { rich_text: [{ text: { content: ensureString(item.user_note, '') } }] },
+        Status: { select: { name: normalizeStatus(ensureString(item.status, 'Needs Manual Context')) } },
+        'Actionability Score': { number: normalizeScore(item.actionability_score) },
+        Confidence: { number: normalizeConfidence(item.confidence) },
+        'Source Text': { rich_text: [{ text: { content: ensureString(item.source_text, '').slice(0, 1800) } }] },
+        Websites: { rich_text: [{ text: { content: ensureArray(item.websites).join(' | ').slice(0, 1800) } }] },
+        Tags: { multi_select: ensureArray(item.tags).slice(0, 6).map(name => ({ name: ensureString(name) })) }
+      }
+    })
+  });
+  if (!resp.ok) throw new Error(`Notion update failed: ${resp.status} ${await resp.text()}`);
   return resp.json();
 }
 
@@ -614,7 +689,7 @@ async function generateAi(input) {
     actionItems.push(...knowledgeCard.steps.slice(0, 4));
   }
 
-  return {
+  const result = {
     title: ensureString(parsed.title, input.media_title || 'Instagram save'),
     type: ensureString(parsed.type, input.source_type || 'Unknown'),
     summary,
@@ -627,6 +702,15 @@ async function generateAi(input) {
     confidence: normalizeConfidence(parsed.confidence),
     knowledge_card: knowledgeCard,
   };
+  result.analysis_quality = classifyAnalysisQuality({
+    status: result.status,
+    summary: result.summary,
+    confidence: result.confidence,
+    action_items: result.action_items,
+    websites: result.websites,
+    knowledge_card: result.knowledge_card,
+  });
+  return result;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -657,13 +741,19 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/instagram-save') {
       const body = await parseBody(req);
+      const safeUrl = validateInstagramUrl(body.url || '');
       const sourceType = body.source_type && body.source_type !== 'Unknown'
         ? body.source_type
-        : (body.url?.includes('/reel/') ? 'Reel' : (body.url?.includes('/p/') ? 'Post' : 'Unknown'));
+        : (safeUrl.includes('/reel/') ? 'Reel' : (safeUrl.includes('/p/') ? 'Post' : 'Unknown'));
 
-      const extracted = await extractInstagramContent(body.url || '');
+      let extracted;
+      try {
+        extracted = await extractInstagramContent(safeUrl);
+      } catch (error) {
+        throw new Error(`Could not extract the Instagram content. ${error.message}`);
+      }
       const ai = await generateAi({
-        url: body.url || '',
+        url: safeUrl,
         source_type: sourceType,
         user_note: ensureString(body.user_note),
         raw_text: ensureString(body.raw_text),
@@ -677,7 +767,7 @@ const server = http.createServer(async (req, res) => {
 
       const created = await createNotionPage({
         ...ai,
-        url: body.url || extracted.originalUrl,
+        url: safeUrl || extracted.originalUrl,
         user_note: ensureString(body.user_note),
         source_text: formatKnowledgeCard(ai.knowledge_card),
       });
@@ -697,12 +787,86 @@ const server = http.createServer(async (req, res) => {
         transcript_source: extracted.transcriptSource,
         actionability_score: ai.actionability_score,
         confidence: ai.confidence,
+        analysis_quality: ai.analysis_quality,
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/instagram-reprocess') {
+      const body = await parseBody(req);
+      const pageId = ensureString(body.page_id);
+      if (!pageId) return sendError(res, 400, 'missing_page_id', 'A page_id is required to reprocess a saved card.');
+      const safeUrl = validateInstagramUrl(body.url || '');
+      const sourceType = safeUrl.includes('/reel/') ? 'Reel' : (safeUrl.includes('/p/') ? 'Post' : 'Unknown');
+
+      let extracted;
+      try {
+        extracted = await extractInstagramContent(safeUrl);
+      } catch (error) {
+        throw new Error(`Could not extract the Instagram content. ${error.message}`);
+      }
+
+      const ai = await generateAi({
+        url: safeUrl,
+        source_type: sourceType,
+        user_note: ensureString(body.user_note),
+        raw_text: ensureString(body.raw_text),
+        media_title: extracted.title,
+        uploader: extracted.uploader,
+        description: extracted.description,
+        transcript_source: extracted.transcriptSource,
+        transcript: extracted.transcript,
+        websites: extracted.websites,
+      });
+
+      await updateNotionAnalysis(pageId, {
+        ...ai,
+        url: safeUrl || extracted.originalUrl,
+        user_note: ensureString(body.user_note),
+        source_text: formatKnowledgeCard(ai.knowledge_card),
+      });
+
+      return sendJson(res, 200, {
+        ok: true,
+        page_id: pageId,
+        title: ai.title,
+        summary: ai.summary,
+        key_takeaway: ai.key_takeaway,
+        action_items: ai.action_items,
+        tags: ai.tags,
+        websites: ai.websites,
+        knowledge_card: ai.knowledge_card,
+        knowledge_card_text: formatKnowledgeCard(ai.knowledge_card),
+        transcript_source: extracted.transcriptSource,
+        actionability_score: ai.actionability_score,
+        confidence: ai.confidence,
+        analysis_quality: ai.analysis_quality,
+        status: ai.status,
       });
     }
 
     return sendJson(res, 404, { ok: false, error: 'Not found' });
   } catch (error) {
-    return sendJson(res, 500, { ok: false, error: error.message });
+    const message = ensureString(error.message, 'Unexpected backend error.');
+    const lower = message.toLowerCase();
+    if (lower.includes('provide an instagram') || lower.includes('use a full instagram')) {
+      return sendError(res, 400, 'invalid_instagram_url', message);
+    }
+    if (lower.includes('took too long') || lower.includes('timed out')) {
+      return sendError(res, 504, 'timeout', 'The backend took too long to finish this request.');
+    }
+    if (lower.includes('extract')) {
+      return sendError(res, 422, 'extract_failed', message);
+    }
+    if (lower.includes('openai')) {
+      return sendError(res, 502, 'ai_failed', 'The AI step failed while building your study card.', message);
+    }
+    if (lower.includes('notion')) {
+      return sendError(res, 502, 'notion_failed', 'The save succeeded locally but Notion rejected the update.', message);
+    }
+    if (lower.includes('yt-dlp')) {
+      return sendError(res, 500, 'downloader_unavailable', 'The media extractor is not available on the backend.', message);
+    }
+    return sendError(res, 500, 'server_error', message);
   }
 });
 
