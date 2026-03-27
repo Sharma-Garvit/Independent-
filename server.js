@@ -16,6 +16,7 @@ const OPENAI_RESEARCH_MODEL = process.env.OPENAI_RESEARCH_MODEL || 'gpt-4.1';
 const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
 const localYtDlpPath = path.join(__dirname, '..', 'extractor', 'yt-dlp.exe');
 const YT_DLP_PATH = process.env.YT_DLP_PATH || (fs.existsSync(localYtDlpPath) ? localYtDlpPath : 'yt-dlp');
+const IS_HOSTED_RUNTIME = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID || process.env.RENDER_EXTERNAL_URL);
 
 let transcriberPromise = null;
 let wavefileModulePromise = null;
@@ -195,6 +196,24 @@ function fallbackBullets(input, max = 5) {
     .map(sentence => sentence.replace(/\s+/g, ' ').trim());
 }
 
+function buildFallbackExtraction(url, raw = {}) {
+  const safeUrl = ensureString(url);
+  const rawText = ensureString(raw.raw_text);
+  const note = ensureString(raw.user_note);
+  const description = [rawText, note].filter(Boolean).join('\n\n');
+  return {
+    title: 'Instagram save',
+    description,
+    uploader: '',
+    duration: null,
+    transcript: rawText,
+    transcriptSource: rawText ? 'user-context' : 'metadata-fallback',
+    websites: extractLinks([safeUrl, rawText].filter(Boolean).join(' ')),
+    combinedText: [description, safeUrl].filter(Boolean).join(' '),
+    originalUrl: safeUrl,
+  };
+}
+
 function parseVtt(content) {
   return content
     .split(/\r?\n/)
@@ -303,7 +322,7 @@ async function extractInstagramContent(url) {
       transcript = '';
     }
 
-    if (!transcript) {
+    if (!transcript && !IS_HOSTED_RUNTIME) {
       await runCommand(YT_DLP_PATH, [
         '-f', 'bestaudio/best',
         '--no-playlist',
@@ -317,6 +336,10 @@ async function extractInstagramContent(url) {
         transcript = await transcribeWav(wavPath);
         if (transcript) transcriptSource = 'whisper';
       }
+    }
+
+    if (!transcript && IS_HOSTED_RUNTIME) {
+      transcriptSource = 'metadata-fallback';
     }
 
     const description = ensureString(info.description);
@@ -750,7 +773,10 @@ const server = http.createServer(async (req, res) => {
       try {
         extracted = await extractInstagramContent(safeUrl);
       } catch (error) {
-        throw new Error(`Could not extract the Instagram content. ${error.message}`);
+        if (!IS_HOSTED_RUNTIME) {
+          throw new Error(`Could not extract the Instagram content. ${error.message}`);
+        }
+        extracted = buildFallbackExtraction(safeUrl, body);
       }
       const ai = await generateAi({
         url: safeUrl,
@@ -802,7 +828,10 @@ const server = http.createServer(async (req, res) => {
       try {
         extracted = await extractInstagramContent(safeUrl);
       } catch (error) {
-        throw new Error(`Could not extract the Instagram content. ${error.message}`);
+        if (!IS_HOSTED_RUNTIME) {
+          throw new Error(`Could not extract the Instagram content. ${error.message}`);
+        }
+        extracted = buildFallbackExtraction(safeUrl, body);
       }
 
       const ai = await generateAi({
