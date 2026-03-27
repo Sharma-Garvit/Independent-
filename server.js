@@ -214,6 +214,93 @@ function buildFallbackExtraction(url, raw = {}) {
   };
 }
 
+function pickTitle(input) {
+  return ensureString(input.media_title)
+    || ensureString(input.uploader && `Video by ${input.uploader}`)
+    || 'Instagram save';
+}
+
+function inferTagsFromText(text) {
+  const tokens = ensureString(text)
+    .toLowerCase()
+    .match(/\b[a-z][a-z0-9+-]{2,}\b/g) || [];
+  const stopWords = new Set([
+    'this', 'that', 'with', 'from', 'have', 'your', 'about', 'what', 'when', 'where',
+    'which', 'there', 'their', 'would', 'could', 'should', 'into', 'while', 'after',
+    'before', 'because', 'using', 'used', 'make', 'makes', 'made', 'more', 'most',
+    'very', 'than', 'then', 'them', 'they', 'the', 'and', 'for', 'are', 'was', 'were',
+    'you', 'how', 'why', 'not', 'too', 'can', 'will', 'just', 'like', 'need', 'want',
+    'save', 'reel', 'post', 'instagram'
+  ]);
+  const counts = new Map();
+  for (const token of tokens) {
+    if (stopWords.has(token)) continue;
+    counts.set(token, (counts.get(token) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 5)
+    .map(([token]) => token);
+}
+
+function buildHeuristicCard(input, reason = '') {
+  const combined = [input.transcript, input.description, input.raw_text, input.user_note].filter(Boolean).join(' ');
+  const bullets = fallbackBullets(input, 6);
+  const resources = [...new Set([
+    ...ensureArray(input.websites),
+    ...extractNamedTools(combined),
+    ...extractLinks(combined)
+  ])].slice(0, 6);
+  const overview = fallbackOverview(input) || 'This save was captured without full AI analysis, so the card is based on visible metadata, caption text, and any notes you added.';
+  const title = pickTitle(input);
+  const caution = reason
+    ? `AI was unavailable during capture: ${reason}`
+    : 'AI was unavailable during capture, so this card may miss nuance from the full reel audio.';
+  const steps = [];
+  if (ensureString(input.user_note)) steps.push(`Revisit this because: ${ensureString(input.user_note)}`);
+  if (resources.length) steps.push(`Check these mentioned tools or links: ${resources.join(', ')}`);
+  if (!steps.length) steps.push('Review the summary and decide whether this save is worth revisiting manually.');
+
+  const knowledgeCard = normalizeKnowledgeCard({
+    reel_overview: overview,
+    exact_topic: bullets[0] || ensureString(input.description).slice(0, 140),
+    who_it_is_for: ensureString(input.user_note) ? 'Useful for the reason noted by the user.' : 'Likely useful to someone researching this topic further.',
+    why_it_matters: bullets[1] || 'This was saved because it likely contains a reusable idea, workflow, or reference.',
+    creator_claims: bullets.slice(0, 4),
+    core_points: bullets.slice(0, 5),
+    steps,
+    tools_and_resources: resources,
+    use_cases: ensureString(input.user_note) ? [ensureString(input.user_note)] : [],
+    cautions: [caution],
+    research_notes: ['Reprocess later when AI is available for a deeper breakdown.'],
+  });
+
+  const summary = bullets.length
+    ? bullets.slice(0, 6)
+    : [
+        'The reel was saved successfully, but AI analysis was unavailable at the time.',
+        'This summary is based on available caption text, links, and any note you added.',
+        'Use the card as a lightweight reminder and reprocess later for a richer breakdown.',
+        resources.length ? `Mentioned tools or links: ${resources.join(', ')}` : 'No clear tool or website could be extracted automatically.'
+      ];
+
+  const result = {
+    title,
+    type: ensureString(input.source_type, 'Unknown'),
+    summary,
+    key_takeaway: bullets[0] || 'Saved for later review with a lightweight fallback summary.',
+    action_items: steps,
+    tags: inferTagsFromText(combined),
+    websites: resources,
+    status: 'Needs Manual Context',
+    actionability_score: resources.length || ensureString(input.user_note) ? 42 : 28,
+    confidence: 0.34,
+    knowledge_card: knowledgeCard,
+  };
+  result.analysis_quality = 'partial';
+  return result;
+}
+
 function parseVtt(content) {
   return content
     .split(/\r?\n/)
@@ -666,11 +753,22 @@ async function generateAi(input) {
   if (OPENAI_API_KEY) {
     try {
       parsed = await generateAiWithOpenAIResearch(input);
-    } catch {
-      parsed = await generateAiWithOpenAI(prompt);
+    } catch (researchError) {
+      try {
+        parsed = await generateAiWithOpenAI(prompt);
+      } catch (openAiError) {
+        return buildHeuristicCard(input, ensureString(openAiError.message || researchError.message, 'OpenAI quota or processing failed.'));
+      }
     }
   } else {
-    parsed = await generateAiWithOllama(prompt);
+    if (IS_HOSTED_RUNTIME) {
+      return buildHeuristicCard(input, 'No hosted AI provider is configured.');
+    }
+    try {
+      parsed = await generateAiWithOllama(prompt);
+    } catch (ollamaError) {
+      return buildHeuristicCard(input, ensureString(ollamaError.message, 'Local AI processing failed.'));
+    }
   }
 
   const knowledgeCard = normalizeKnowledgeCard(parsed.knowledge_card);
