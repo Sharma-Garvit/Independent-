@@ -17,6 +17,7 @@ const OLLAMA_BASE_URL = process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434';
 const localYtDlpPath = path.join(__dirname, '..', 'extractor', 'yt-dlp.exe');
 const YT_DLP_PATH = process.env.YT_DLP_PATH || (fs.existsSync(localYtDlpPath) ? localYtDlpPath : 'yt-dlp');
 const IS_HOSTED_RUNTIME = Boolean(process.env.RENDER || process.env.RENDER_SERVICE_ID || process.env.RENDER_EXTERNAL_URL);
+const activeCaptureRequests = new Map();
 
 let transcriberPromise = null;
 let wavefileModulePromise = null;
@@ -37,6 +38,13 @@ function sendJson(res, status, data) {
 
 function sendError(res, status, code, error, detail = '') {
   return sendJson(res, status, { ok: false, code, error, detail });
+}
+
+function normalizeInstagramUrl(url) {
+  const safeUrl = validateInstagramUrl(url);
+  const parsed = new URL(safeUrl);
+  const parts = parsed.pathname.split('/').filter(Boolean);
+  return `https://www.instagram.com/${parts[0]}/${parts[1] || ''}/`;
 }
 
 function parseBody(req) {
@@ -62,6 +70,13 @@ function ensureArray(value) {
   if (Array.isArray(value)) return value;
   if (typeof value === 'string' && value.trim()) return [value.trim()];
   return [];
+}
+
+function parseStoredDelimitedText(value) {
+  return ensureArray(value)
+    .flatMap(entry => String(entry).split('|'))
+    .map(entry => ensureString(entry))
+    .filter(Boolean);
 }
 
 function ensureNumber(value, fallback = 0) {
@@ -496,6 +511,7 @@ function mapNotionItem(page) {
     actionability_score: props['Actionability Score']?.number ?? 0,
     confidence: props.Confidence?.number ?? 0
   };
+  item.canonical_url = item.url ? normalizeInstagramUrl(item.url).replace(/\/$/, '') : '';
   item.analysis_quality = classifyAnalysisQuality({
     status: item.status,
     summary: ensureArray(item.summary),
@@ -505,6 +521,14 @@ function mapNotionItem(page) {
     knowledge_card: { reel_overview: extractSectionForQuality(item.source_text, 'What Was Said') }
   });
   return item;
+}
+
+async function findExistingCaptureByUrl(url) {
+  const canonicalUrl = normalizeInstagramUrl(url).replace(/\/$/, '');
+  const notion = await notionQuery();
+  return (notion.results || [])
+    .map(mapNotionItem)
+    .find(item => item.canonical_url === canonicalUrl) || null;
 }
 
 async function createNotionPage(item) {
@@ -816,7 +840,7 @@ async function generateAi(input) {
     summary,
     key_takeaway: ensureString(parsed.key_takeaway, 'Review this saved item later.'),
     action_items: actionItems,
-    tags: ensureArray(parsed.tags),
+    tags: [...new Set(ensureArray(parsed.tags).map(tag => ensureString(tag).toLowerCase()).filter(Boolean))].slice(0, 6),
     websites: mergedResources,
     status: normalizeStatus(ensureString(parsed.status, input.transcript ? 'New' : 'Needs Manual Context')),
     actionability_score: normalizeScore(parsed.actionability_score),
@@ -862,64 +886,92 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'POST' && url.pathname === '/instagram-save') {
       const body = await parseBody(req);
-      const safeUrl = validateInstagramUrl(body.url || '');
+      const safeUrl = normalizeInstagramUrl(body.url || '');
+      if (activeCaptureRequests.has(safeUrl)) {
+        return sendError(res, 409, 'capture_in_progress', 'This reel is already being processed. Please wait a few seconds and refresh.');
+      }
+      const existing = await findExistingCaptureByUrl(safeUrl);
+      if (existing) {
+        return sendJson(res, 200, {
+          ok: true,
+          deduplicated: true,
+          page_id: existing.page_id,
+          title: existing.title,
+          status: existing.status,
+          summary: parseStoredDelimitedText(existing.summary),
+          key_takeaway: existing.key_takeaway,
+          action_items: parseStoredDelimitedText(existing.action_items),
+          tags: existing.tags,
+          websites: parseStoredDelimitedText(existing.websites),
+          knowledge_card_text: existing.source_text,
+          transcript_source: existing.transcript_source || 'existing',
+          actionability_score: existing.actionability_score,
+          confidence: existing.confidence,
+          analysis_quality: existing.analysis_quality,
+        });
+      }
       const sourceType = body.source_type && body.source_type !== 'Unknown'
         ? body.source_type
         : (safeUrl.includes('/reel/') ? 'Reel' : (safeUrl.includes('/p/') ? 'Post' : 'Unknown'));
 
-      let extracted;
+      activeCaptureRequests.set(safeUrl, Date.now());
       try {
-        extracted = await extractInstagramContent(safeUrl);
-      } catch (error) {
-        if (!IS_HOSTED_RUNTIME) {
-          throw new Error(`Could not extract the Instagram content. ${error.message}`);
+        let extracted;
+        try {
+          extracted = await extractInstagramContent(safeUrl);
+        } catch (error) {
+          if (!IS_HOSTED_RUNTIME) {
+            throw new Error(`Could not extract the Instagram content. ${error.message}`);
+          }
+          extracted = buildFallbackExtraction(safeUrl, body);
         }
-        extracted = buildFallbackExtraction(safeUrl, body);
+        const ai = await generateAi({
+          url: safeUrl,
+          source_type: sourceType,
+          user_note: ensureString(body.user_note),
+          raw_text: ensureString(body.raw_text),
+          media_title: extracted.title,
+          uploader: extracted.uploader,
+          description: extracted.description,
+          transcript_source: extracted.transcriptSource,
+          transcript: extracted.transcript,
+          websites: extracted.websites,
+        });
+
+        const created = await createNotionPage({
+          ...ai,
+          url: safeUrl || extracted.originalUrl,
+          user_note: ensureString(body.user_note),
+          source_text: formatKnowledgeCard(ai.knowledge_card),
+        });
+
+        return sendJson(res, 200, {
+          ok: true,
+          status: ai.status,
+          page_id: created.id,
+          title: ai.title,
+          summary: ai.summary,
+          key_takeaway: ai.key_takeaway,
+          action_items: ai.action_items,
+          tags: ai.tags,
+          websites: ai.websites,
+          knowledge_card: ai.knowledge_card,
+          knowledge_card_text: formatKnowledgeCard(ai.knowledge_card),
+          transcript_source: extracted.transcriptSource,
+          actionability_score: ai.actionability_score,
+          confidence: ai.confidence,
+          analysis_quality: ai.analysis_quality,
+        });
+      } finally {
+        activeCaptureRequests.delete(safeUrl);
       }
-      const ai = await generateAi({
-        url: safeUrl,
-        source_type: sourceType,
-        user_note: ensureString(body.user_note),
-        raw_text: ensureString(body.raw_text),
-        media_title: extracted.title,
-        uploader: extracted.uploader,
-        description: extracted.description,
-        transcript_source: extracted.transcriptSource,
-        transcript: extracted.transcript,
-        websites: extracted.websites,
-      });
-
-      const created = await createNotionPage({
-        ...ai,
-        url: safeUrl || extracted.originalUrl,
-        user_note: ensureString(body.user_note),
-        source_text: formatKnowledgeCard(ai.knowledge_card),
-      });
-
-      return sendJson(res, 200, {
-        ok: true,
-        status: ai.status,
-        page_id: created.id,
-        title: ai.title,
-        summary: ai.summary,
-        key_takeaway: ai.key_takeaway,
-        action_items: ai.action_items,
-        tags: ai.tags,
-        websites: ai.websites,
-        knowledge_card: ai.knowledge_card,
-        knowledge_card_text: formatKnowledgeCard(ai.knowledge_card),
-        transcript_source: extracted.transcriptSource,
-        actionability_score: ai.actionability_score,
-        confidence: ai.confidence,
-        analysis_quality: ai.analysis_quality,
-      });
     }
 
     if (req.method === 'POST' && url.pathname === '/instagram-reprocess') {
       const body = await parseBody(req);
       const pageId = ensureString(body.page_id);
       if (!pageId) return sendError(res, 400, 'missing_page_id', 'A page_id is required to reprocess a saved card.');
-      const safeUrl = validateInstagramUrl(body.url || '');
+      const safeUrl = normalizeInstagramUrl(body.url || '');
       const sourceType = safeUrl.includes('/reel/') ? 'Reel' : (safeUrl.includes('/p/') ? 'Post' : 'Unknown');
 
       let extracted;
@@ -980,6 +1032,9 @@ const server = http.createServer(async (req, res) => {
     }
     if (lower.includes('took too long') || lower.includes('timed out')) {
       return sendError(res, 504, 'timeout', 'The backend took too long to finish this request.');
+    }
+    if (lower.includes('already being processed')) {
+      return sendError(res, 409, 'capture_in_progress', message);
     }
     if (lower.includes('extract')) {
       return sendError(res, 422, 'extract_failed', message);
